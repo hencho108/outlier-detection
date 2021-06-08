@@ -1,0 +1,225 @@
+---
+title: "Outlier Detection"
+subtitle: "Testing common outlier detection methods on breast cancer biopsies"
+author: "[Hendrik Mischo](https://github.com/hendrik-mischo)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  github_document: default
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float: false
+    number_sections: true
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_format = "all") })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width = 8, fig.height = 6, fig.align = "center", echo = TRUE, warning = FALSE, message = FALSE, autodep = TRUE, cache = TRUE, options(scipen = 999), comment = "", fig.path = "files/")
+```
+
+# Objective
+
+The objective of this project is to detect anomalies, i.e. patterns that do not conform to "normal" behavior, in a dataset of breast cancer biopsies. We will use the Mahalanobis Distance as an outlier detection method as well as two common clustering algorithms: DBSCAN and Expectation Maximization. Finally, we will compare the results and highlight the strengths and weaknesses of each approach.
+
+
+# Data Exploration & Cleaning
+
+The dataset was downloaded from UCI machine learning repositories. It includes 699 examples of cancer biopsies, each with the following features: 
+
+- Sample code number
+- Clump Thickness
+- Uniformity of Cell Size
+- Uniformity of Cell Shape
+- Marginal Adhesion
+- Single Epithelial Cell Size
+- Bare Nuclei
+- Bland Chromatin
+- Normal Nucleoli
+- Mitoses
+
+There is also a class label indication the diagnosis coded as M (malignant) or B (benign).
+
+Looking at the feature names, the features seem to relate to the shape and size of the cell nuclei. However, it would require domain knowledge to understand how each of them relate to the cancer diagnosis.
+
+Let's start by importing the relevant libraries.
+
+```{r}
+library(tidyverse)  # Data wrangling
+library(data.table) # Data tables
+library(MVN)        # Multivariate outlier detection
+library(dbscan)     # DBSCAN
+library(mclust)     # Expectation Maximization
+```
+
+Let's import the data and take a look at its structure.
+
+```{r}
+data = read.table("breast-cancer-wisconsin.data", sep = ",",
+                  col.names = c("id", "clump_thickness", "uniform_cell_size", "uniform_cell_shape", 
+                                "marginal_adhesion", "single_epithelial_cell_size", "bare_nuclei", 
+                                "bland_chromatin", "normal_nucleoli", "mitoses", "class"
+                                )
+                  )
+summary(data)
+head(data, 10)
+```
+   
+From the dataset description we know that there are 16 instances in `bare_nuclei` that contain a single missing (i.e., unavailable) attribute value, denoted as "?". Moreover, we can see that there are duplicate IDs, however eventhough the entries have the same IDs, the feature values may be different.
+
+We will perform the following mutations to the data:
+
+- Remove missing values
+- Encode class label as binary (0 = B, 1 = M)
+- Append a counter to duplicate IDs to make them unique
+- Remove `id` column and set them as row names instead
+- Scale the data so that each feature contributes equally
+
+```{r}
+data = data %>% 
+  filter(!bare_nuclei == "?") %>%                               
+  mutate(bare_nuclei = as.numeric(as.character(bare_nuclei)),   
+         class = ifelse(class == 4, 1, 0),
+         class = as.integer(class),
+         id = make.unique(as.character(id)))                         
+row.names(data) = data$id
+data = data[,names(data) != "id"]
+data_ = as.data.frame(scale(data))
+summary(data_)
+```
+
+
+# Dimensionality Reduction
+
+When many variables are present, it is impossible to plot the data so it is difficult to get a sense of the underlying trends. We can reduce dimensionality by performing perform principal component analysis (PCA). 
+
+PCA allows us to see the overall “shape” of the data, identifying which observations are similar to one another and which are very different.
+
+```{r}
+pca = prcomp(data_[,1:10])
+summary(pca)
+```
+
+We have obtained 10 principal components (PCs) each explaining a certain percentage of the total variation of the data. From the cumulative proportion of explained variance, we see that *PC1* and *PC2* alone explain about 75% of the information in the dataset. Hence, by knowing the position of an example relative to just these two principal components, we can get a good idea of where it stands in relation to other examples.
+
+Let’s prepare the data for plotting.
+
+```{r}
+embedding = data.table(pca$x[, 1:2])
+embedding[, entry := rownames(data_)]
+embedding[, class := data$class]
+head(embedding)
+```
+
+Let’s plot the data in terms of *PC1* and *PC2*. We color-code the observations by the class label, so that we can see which ones are cancer patiens and which are not.
+
+```{r}
+ggplot(embedding, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = factor(class)), size = 5, alpha = 0.3) +
+  geom_text(aes(label = entry), check_overlap = TRUE) +
+  ggtitle("Data Distribution and Diagnosis") +
+  theme_minimal()
+```
+
+The two groups are separated quite clearly, which indicates that cancer patients and non-cancer patients have rather different characteristics with respect to the features. We also see that the non-cancer group is significantly more dense than the cancer group. This means that people who do not have the cancer are rather similar and among the cancer group, people can be relatively different. 
+
+
+# Outlier Detection
+
+With the principal components we derived in the previous section we can now apply different outlier detection algorithms and visualize and compare the results.
+
+
+## Mahalanobis Distance
+
+Let's explore the Mahalanobis distance outlier detection method for this example. The Mahalanobis distance is a measure of the distance between a point P and a distribution D. It is a multi-dimensional generalization of the idea of measuring how many standard deviations away P is from the mean of D.
+
+```{r}
+results_mvn = MVN::mvn(data = data_, mvnTest = "hz",
+                       univariateTest = "AD", univariatePlot = "histogram",
+                       multivariatePlot = "qq", multivariateOutlierMethod = "quan",
+                       showOutliers = TRUE)
+```
+
+With this method we obtain 325 outliers, which is a lot given that it is almost half the dataset. However, the advantage of this technique is that it allows us to distinguish between less significant and more significant outliers. From the histograms we see that the vast majority of observations fall into one bin and the density falls off very quickly for most variables. However, for some variables, `bare_nuclei` for example, there is a significant proportion of observations that have an extremely high value on a particular feature.
+
+Let's plot the outliers we identified.
+
+```{r}
+outliers_mah = data.table(entry = rownames(results_mvn$multivariateOutliers), 
+                          MahalanobisOutlier = results_mvn$multivariateOutliers$Outlier)
+outliers_mah = merge(embedding, outliers_mah, by = "entry")
+
+ggplot(outliers_mah, aes(x = PC1, y = PC2)) +
+  geom_point(size = 5, color = "red", alpha = 0.3) +
+  geom_text(aes(label = as.character(outliers_mah$entry)), check_overlap = TRUE) +
+  ggtitle("Mahalanobis Outliers") +
+  theme_minimal() 
+```
+
+This plot looks rather similar to the overall distribution of the data. It appears that MD found outliers across the board with no particular location with respect to *PC1* and *PC2*. This is not surprising given that it identified half the dataset as outliers.
+
+
+## DBSCAN
+
+DBSCAN is a density-based clustering algorithm that takes two parameters: the neighbourhood (eps) and the search radius for each point (minPts). The algorithm finds clusters by grouping those points that are density-reachable from each other into equal clusters. Those points that cannot be assigned to a clusters given the parameters are considered outliers.
+
+```{r}
+dbs1 = dbscan(data_, eps = 1, minPts = 3)
+dbs1
+```
+
+We obtained 266 outliers and 3 clusters. This result may not be too interesting for us because we still have too many outliers and 2 of the three clusters are nearly empty. The algorithm is highly sensitive to changes in parameters, so let’s see how the result changes if we increase the search radius and minimum number of points slightly.
+
+```{r}
+dbs2 = dbscan(data_, eps = 2, minPts = 4)
+dbs2
+```
+
+This result is a lot more interesting. We obtained 55 outliers, which is a lot more manageable than two large clusters. Let's add the clusters to our PCA data frame and plot them.
+
+```{r}
+embedding[, DClusters := dbs2$cluster]
+head(embedding)
+```
+
+```{r}
+ggplot(embedding, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = factor(DClusters)), size = 5, alpha = 0.3) +
+  geom_text(aes(label = entry), check_overlap = TRUE) +
+  theme_minimal()
+```
+
+This is an interesting result since this plot looks very similar to the first one where we only colored the class label. It appears that DBSCAN essentially created one cluster for non-cancer observations, one for cancer observations and a third one for outliers. The outliers can be found particularly among the cancer patients, whereas the non-cancer group does not mix a lot with the outlier cluster, confirming our initial hypothesis that the non-cancer observations are a lot more similar than the cancer observations to themselves.
+
+
+## Expectation Maximization
+
+Expectation Maximisation is an unsupervised clustering algorithm that tries to find “similar subspaces” based on their orientation and variance. Similar to KNN it iteratively creates clusters by regrouping and optimizing the clusters until convergence. The key distinction between KNN and EM is that whereas KNN assigns each point to the cluster of the nearest centroid, EM assigns each point to the cluster to which it most likely belongs given a distribution that is iteratively optimized. The parameter *G*, an integer vector specifying the numbers of mixture components (clusters), needs to be specified.
+
+Let's apply the algorithm and append the identified clusters to our PC data frame.
+
+```{r}
+expmax = Mclust(data_, G = 4)
+
+embedding[, EMClusters := expmax$classification]
+embedding
+```
+
+Now plot the result.
+
+```{r}
+ggplot(embedding, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = factor(EMClusters)), size = 5, alpha = 0.3) +
+  geom_text(aes(label = entry), check_overlap = TRUE) +
+  theme_minimal()
+```
+
+Here we get a rather clear separation of the two main clusters. Cluster 1 is the outlier cluster. Unlike in DBSCAN and Mahalanobis, outliers are located much closer to each other and fall in between the cancer and non-cancer observations. Also now the outliers mix with the non-cancer patients rather than with the cancer patients. This result could be very useful if our goal is to detect edge cases.
+
+
+# Conclusion
+
+Previously, we have seen that the choice of outlier detection method can greatly influence the outcome. Therefore, depending on the objective one or the other should be used. In this case, Mahalanobis distance is useful when our goal is to distinguish between less significant and more significant outliers. DBSCAN performed well at clustering cancer and non-cancer, plus some very anomalous cases. Lastly, EM would be a good choice if we want to identify patients that should be tested more thoroughly or who should get a second opinion on their diagnosis.
+
+
+
